@@ -1,0 +1,200 @@
+#!/usr/bin/env python
+import sys
+import json
+
+typenametoslsid = {}
+slsids = []
+extenddata = None
+orders = {}
+
+mappings = {}
+
+
+# mapping of requisite type to color of arrow for graphviz
+requisitetypes = {
+    'require':      "red", 
+    'require_in':   "red", 
+    'watch':        "green", 
+    'watch_in':     "green",
+}
+
+
+
+def parseMetaData(saltdata):
+    # first pass through to generate all of the name/type to sls id mappings and catalog all the sls ids so we can use them to look up sls ids later
+    for slsid,statedata in saltdata['local'].items():
+        slsids.append(slsid)
+        if slsid == '__extend__':
+            extenddata = statedata
+            # we will parse extends after other data
+            continue
+        for tp, tpinfo in statedata.items():
+            for entry in tpinfo:
+                if not isinstance(entry, dict):
+                    continue
+                for k,v in entry.items():
+                    if k == 'name':
+                        if tp not in typenametoslsid:
+                            typenametoslsid[tp] = {}
+                        typenametoslsid[tp][v] = slsid
+                    if k == 'order':
+                        orders[slsid] = v
+
+    # this parses an "extends" section if it exists and apply those value as overrides
+    if extenddata is not None:
+        for extendentry in extenddata:
+            for slsid,statedata in extendentry.items():
+                for tp, tpinfo in statedata.items():
+                    for entry in tpinfo:
+                        if not isinstance(entry, dict):
+                            continue
+                        for k,v in entry.items():
+                            if k == 'name':
+                                if tp not in typenametoslsid:
+                                    typenametoslsid[tp] = {}
+                                typenametoslsid[tp][v] = slsid
+                            if k == 'order':
+                                orders[slsid] = v
+                
+def parseMappings(saltdata):
+    for slsid,statedata in saltdata['local'].items():
+        # print(slsid)
+        if slsid == '__extend__':
+            extenddata = statedata
+            # we will parse extends after other data
+            continue
+        if slsid not in mappings:
+            mappings[slsid] = []
+        for tp, tpinfo in statedata.items():
+            for entry in tpinfo:
+                if not isinstance(entry, dict):
+                    continue
+                for k,v in entry.items():
+                    if k in requisitetypes:
+                        for reqentry in v:
+                            if isinstance(reqentry, dict):
+                                for t, dest in reqentry.items():
+                                    # print("found {} for {}:{} in {}".format(k, t, dest, slsid))
+                                    if dest in slsids:
+                                        destsls = dest
+                                    else:
+                                        destsls = typenametoslsid.get(t, {}).get(dest, None)
+                                    if destsls is None:
+                                        # these are requires on other states that are external but we can still link them
+                                        if t == 'sls':
+                                            mappings[slsid].append({"type": k, "dest": dest})
+                                        else:
+                                            # print("ERROR: Unable to map {}: {} to an sls id".format(t, dest))
+                                            pass
+                                    else:
+                                        mappings[slsid].append({"type": k, "dest": destsls})
+                            else:
+                                # print("found {} for sls:{} in {}".format(k, reqentry, slsid))
+                                mappings[slsid].append({"type": k, "dest": reqentry})
+
+    # parse any requisites defined in "extends" sections
+    if extenddata is not None:
+        for extendentry in extenddata:
+            for slsid,statedata in extendentry.items():
+                for tp, tpinfo in statedata.items():
+                    for entry in tpinfo:
+                        if not isinstance(entry, dict):
+                            continue
+                        for k,v in entry.items():
+                            if k in requisitetypes:
+                                for reqentry in v:
+                                    if isinstance(reqentry, dict):
+                                        for t, dest in reqentry.items():
+                                            # print("found {} for {}:{} in {}".format(k, t, dest, slsid))
+                                            if dest in slsids:
+                                                destsls = dest
+                                            else:
+                                                destsls = typenametoslsid.get(t, {}).get(dest, None)
+                                            if destsls is None:
+                                                # these are requires on other states that are external but we can still link them
+                                                if t == 'sls':
+                                                    mappings[slsid].append({"type": k, "dest": dest})
+                                                else:
+                                                    # print("ERROR: Unable to map {}: {} to an sls id".format(t, dest))
+                                                    pass
+                                            else:
+                                                mappings[slsid].append({"type": k, "dest": destsls})
+                                    else:
+                                        # print("found {} for sls:{} in {}".format(k, reqentry, slsid))
+                                        mappings[slsid].append({"type": k, "dest": reqentry})
+
+# attaches the order id to a state name if we have one
+def nodename(slsid):
+    if slsid in orders:
+        return "{} ({})".format(slsid, orders[slsid])
+    return slsid
+
+# set keeps track of nodes that have been defined so we don't redefine the same nodes more than once
+generatedNodes = set([])
+def node(slsid):
+    if slsid not in generatedNodes:
+        generatedNodes.add(slsid)
+        return '"{}" [shape=oval]'.format(nodename(slsid))
+    return None
+
+def usage():
+    print("Usage: {} [JSON_FILENAME]".format(sys.argv[0]))
+    print("\nProcesses the json output from salt-call state.show_sls MYSTATE --out json")
+    print("Supports piping output from other programs through stdin with an empty JSON_FILENAME")
+
+
+
+def main():
+    pipedinput = True
+    stream = sys.stdin
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "-h":
+            usage()
+            exit()
+        stream = open(sys.argv[1])
+        pipedinput = False
+    
+    if sys.stdin.isatty() and pipedinput:
+        usage()
+        exit()
+
+    inputdata = stream.read()
+    saltdata = json.loads(inputdata)
+
+    parseMetaData(saltdata)
+    parseMappings(saltdata)
+    output = []
+    output.append("digraph {")
+    for slsid, links in mappings.items():
+        nodedata = node(slsid)
+        if nodedata is not None:
+            output.append(nodedata)
+        for link in links:
+            nodedata = node(link['dest'])
+            if nodedata is not None:
+                output.append(nodedata)
+            fromnode = slsid
+            tonode = link['dest']
+            # if it uses *_in syntax, flip the source and dest and we will strip the _in suffix on the linkage
+            if link['type'].endswith("_in"):
+                fromnode = link['dest']
+                tonode = slsid
+            if link['type'] in requisitetypes:
+                color = requisitetypes[link['type']]
+            else:
+                color = "black"
+            output.append('"{}" -> "{}" [label="{}", color={}]'.format(nodename(fromnode), nodename(tonode), link['type'].replace("_in", "(_in)"), color))
+
+    output.append("}")
+
+    outputDotFile(output)
+
+
+def outputDotFile(outputlines):
+    for line in outputlines:
+        print(line)
+
+
+
+if __name__ == "__main__":
+    main()
